@@ -1,0 +1,107 @@
+name: DigitalPlat-Auto-Renew
+
+# 每月 1 日自动检查并续期 DigitalPlat 域名，结果写入 Actions 日志 / Summary，
+# 并可通过 Telegram、PushPlus 推送。
+on:
+  schedule:
+    # 分钟 小时 天 月 星期（均为 UTC）
+    # 23 0 1 * * = 每月 1 日 UTC 00:23，即北京时间 08:23
+    #
+    # 为什么不是整点：GitHub 官方文档说明 schedule 在高负载时会延迟甚至丢弃任务，
+    # 而「每个整点」正是高负载时段，所以刻意错开到 :23。
+    - cron: '23 0 1 * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只检查不续期（dry-run）'
+        type: boolean
+        default: false
+      threshold_days:
+        description: '续期阈值天数（留空则用仓库变量或默认 120）'
+        required: false
+        default: ''
+      only:
+        description: '只处理指定域名（逗号分隔，留空则处理全部）'
+        required: false
+        default: ''
+
+# 同一时间只跑一个，避免手动触发与定时任务撞车导致重复续期
+concurrency:
+  group: digitalplat-auto-renew
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          # keepalive 步骤要做 rebase/push，浅克隆会导致 pull --rebase 失败
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check API key
+        id: check_env
+        env:
+          DIGITALPLAT_API_KEY: ${{ secrets.DIGITALPLAT_API_KEY }}
+        run: |
+          if [ -z "$DIGITALPLAT_API_KEY" ]; then
+            if [ "${{ github.event_name }}" = "schedule" ]; then
+              echo "::warning::未配置 DIGITALPLAT_API_KEY，跳过本次定时任务。请在 Settings -> Secrets and variables -> Actions 中添加。"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::缺少 DIGITALPLAT_API_KEY。请在 Settings -> Secrets and variables -> Actions 中添加。"
+            exit 1
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Run renew script
+        if: steps.check_env.outputs.skip != 'true'
+        env:
+          # Secrets（敏感，日志中会自动脱敏）
+          DIGITALPLAT_API_KEY: ${{ secrets.DIGITALPLAT_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          PUSHPLUS_TOPIC: ${{ secrets.PUSHPLUS_TOPIC }}
+          # Variables（可选，非敏感；不配则用脚本默认值）
+          DIGITALPLAT_THRESHOLD_DAYS: ${{ github.event.inputs.threshold_days || vars.DIGITALPLAT_THRESHOLD_DAYS }}
+          DIGITALPLAT_RENEWAL_YEARS: ${{ vars.DIGITALPLAT_RENEWAL_YEARS }}
+          DIGITALPLAT_PAYMENT_METHOD: ${{ vars.DIGITALPLAT_PAYMENT_METHOD }}
+          DIGITALPLAT_MIN_INTERVAL: ${{ vars.DIGITALPLAT_MIN_INTERVAL }}
+          DIGITALPLAT_TZ_OFFSET: ${{ vars.DIGITALPLAT_TZ_OFFSET }}
+          DIGITALPLAT_API_BASE_URL: ${{ vars.DIGITALPLAT_API_BASE_URL }}
+          DIGITALPLAT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          DIGITALPLAT_ONLY: ${{ github.event.inputs.only }}
+        run: python renew_domains.py
+
+      # GitHub 会在公开仓库 60 天无提交后自动停用定时工作流（schedule 触发的运行不算活动）。
+      # 每月写一个时间戳并提交，确保定时任务不会被静默停用。
+      - name: Keep scheduled workflow enabled
+        if: always()
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git add .keepalive
+          if git diff --cached --quiet; then
+            echo "无变更，跳过提交"
+            exit 0
+          fi
+          git commit -m "chore: keepalive $(date -u +%Y-%m-%d)"
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          git push

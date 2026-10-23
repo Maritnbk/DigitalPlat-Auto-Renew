@@ -1,0 +1,17 @@
+# 本地凭据，切勿提交
+key.txt
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 抓取的文档快照（体积大且非源码），需要时本地保留即可
+*.mhtml
+
+# 本地调试产物
+*.log
