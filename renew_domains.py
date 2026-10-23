@@ -607,6 +607,7 @@ class DomainView:
     domain: str = ""
     status: Optional[str] = None
     slot_type: Optional[str] = None
+    domain_kind: Optional[str] = None
     lifecycle_type: Optional[str] = None
     expires_raw: Optional[str] = None
     expires_on: Optional[date] = None
@@ -623,11 +624,35 @@ class DomainView:
 
     @property
     def permanent(self):
+        """是否永久有效（即没有到期日）。
+
+        实测 DigitalPlat 会对平台自营子域名（domain_kind=operated，如 dpdns.org）
+        同时返回 lifecycle_type="permanent" 和一个真实到期日（如 "20270419"）。
+        只凭 lifecycle_type 判永久，会把「还剩 178 天到期」的域名说成「永久有效」，
+        既不符合事实，也把到期日藏了起来。所以以「有没有可解析的到期日」为准：
+        有到期日就按到期日算，没有才认定永久。
+        """
+        if self.expires_on is not None:
+            return False
         lifecycle = str(self.lifecycle_type or "").strip().lower()
         if lifecycle in PERMANENT_LIFECYCLES:
             return True
         raw = str(self.expires_raw or "").strip().lower()
         return raw in ("permanent", "never")
+
+    @property
+    def platform_operated(self):
+        """平台自营子域名（domain_kind=operated）。
+
+        这类域名不走 registrar 续期接口：实测 POST /domains/{domain}/renew
+        返回 404 registered_domain_not_found。所以报告里要标出来，
+        避免用户以为「脚本漏续了」。
+        """
+        return str(self.domain_kind or "").strip().lower() == "operated"
+
+    @property
+    def kind_note(self):
+        return "，平台自营子域名" if self.platform_operated else ""
 
     @property
     def pending_delete(self):
@@ -648,6 +673,7 @@ def normalize_domain(raw, account, index, tz, today):
         domain=domain,
         status=raw.get("status"),
         slot_type=raw.get("slot_type"),
+        domain_kind=raw.get("domain_kind"),
         lifecycle_type=raw.get("lifecycle_type"),
         expires_raw=raw.get("expires_at") or raw.get("expiry_date"),
     )
@@ -669,10 +695,12 @@ def decide(view, threshold_days):
     """
     if view.problem:
         return "invalid"
-    if view.permanent:
-        return "permanent"
+    # pendingdelete 优先于 permanent：域名已被删除进入待释放状态，
+    # 即使没有到期日也要让人看见「它正在被释放」，不能报成永久有效。
     if view.pending_delete:
         return "pendingdelete"
+    if view.permanent:
+        return "permanent"
     if view.days_remaining is None:
         # 到期时间未知：宁可多撞一次「未到窗口」，也不要漏掉真要过期的域名
         return "renew"
@@ -707,7 +735,7 @@ def expiry_line(view):
     if view.expires_on is not None:
         text = f"{view.label}: 到期 {view.expires_on.isoformat()}"
         if remaining:
-            text += f"（{remaining}）"
+            text += f"（{remaining}{view.kind_note}）"
         return text + status_note(view)
     if view.expires_raw:
         return f"{view.label}: 到期 {view.expires_raw}（无法解析剩余天数）{status_note(view)}"
@@ -928,14 +956,15 @@ def build_summary_markdown(config, started_at, accounts, renewal_lines, expiry_l
     lines.append("")
     lines.append("### 所有域名到期时间")
     lines.append("")
-    lines.append("| 域名 | 到期时间 | 剩余天数 | 状态 | 槽位 |")
-    lines.append("| --- | --- | --- | --- | --- |")
+    lines.append("| 域名 | 到期时间 | 剩余天数 | 状态 | 槽位 | 类型 |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
     for view in expiry_lines:
         expires = ("永久" if view.permanent
                    else view.expires_on or view.expires_raw or "未知")
         lines.append(f"| `{view.label}` | {expires} | "
                      f"{'' if view.days_remaining is None else view.days_remaining} | "
-                     f"{view.status or '-'} | {view.slot_type or '-'} |")
+                     f"{view.status or '-'} | {view.slot_type or '-'} | "
+                     f"{view.domain_kind or '-'} |")
     if has_failure:
         lines.append("")
         lines.append("> ⚠️ 存在失败项，请查看运行日志并人工处理。")
@@ -998,9 +1027,12 @@ def renew_one(client, view, api_key, config, today):
     detail = describe_error(payload)
     if is_benign(payload):
         code, _, _ = error_parts(payload)
-        reason = ("非注册商域名，无需续期"
-                  if str(code or "").lower() == "registered_domain_not_found"
-                  else "无需续期或尚未进入续期窗口")
+        if str(code or "").lower() == "registered_domain_not_found":
+            reason = ("平台自营子域名，不通过注册商接口续期"
+                      if view.platform_operated
+                      else "非注册商域名，不通过注册商接口续期")
+        else:
+            reason = "无需续期或尚未进入续期窗口"
         return RenewOutcome(f"⏭️ {view.label}: {reason}（{detail}）", False, benign=True)
     return RenewOutcome(f"❌ {view.label}: 续期失败（{detail}）", True)
 
@@ -1054,7 +1086,7 @@ def run(config, client, notifier, started_at=None, today=None):
                 gh_annotation("error", line)
                 continue
             if action == "permanent":
-                renewal_lines.append(f"⏭️ {view.label}: 永久有效，跳过续期")
+                renewal_lines.append(f"⏭️ {view.label}: 无到期日，按永久有效处理，跳过续期")
                 continue
             if action == "pendingdelete":
                 has_failure = True
@@ -1063,9 +1095,10 @@ def run(config, client, notifier, started_at=None, today=None):
                 gh_annotation("error", line)
                 continue
             if action == "skip":
+                kind = "（平台自营子域名）" if view.platform_operated else ""
                 renewal_lines.append(
                     f"⏭️ {view.label}: {describe_remaining(view)} > {config.threshold_days} 天，"
-                    "尚未进入续期窗口，跳过"
+                    f"尚未进入续期窗口，跳过{kind}"
                 )
                 continue
 
